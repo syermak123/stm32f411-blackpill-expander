@@ -1,0 +1,18 @@
+# Build artifacts
+build/
+Debug/
+Release/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+# IDE/system
+.vscode/
+.idea/
+*.swp
+.DS_Store
+# Python cache (для скрипта генерації PDF)
+__pycache__/
+*.pyc
