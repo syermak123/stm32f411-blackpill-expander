@@ -67,6 +67,8 @@ pio device monitor
 Detailed protocol/pinout docs and examples:
 - `docs/I2C_PROTOCOL_AND_PINS.md`
 - `docs/I2C_PROTOCOL_AND_PINS.pdf`
+- `docs/ESP32_ARDUINO_EXAMPLE.md`
+- `examples/esp32-arduino/esp32_i2c_expander.ino`
 
 ### Reliability Notes
 
@@ -143,6 +145,8 @@ pio device monitor
 Детальна документація по пін-аутах, протоколу і прикладах:
 - `docs/I2C_PROTOCOL_AND_PINS.md`
 - `docs/I2C_PROTOCOL_AND_PINS.pdf`
+- `docs/ESP32_ARDUINO_EXAMPLE.md`
+- `examples/esp32-arduino/esp32_i2c_expander.ino`
 
 ### Нотатки по надійності
 
