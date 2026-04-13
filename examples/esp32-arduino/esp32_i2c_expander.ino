@@ -42,6 +42,24 @@ static uint16_t readGpioLevels() {
   return (uint16_t)in[0] | ((uint16_t)in[1] << 8);
 }
 
+// 0x44: 10 x uint16 LE — ADC1_IN0..IN9 (PA0..PA7, PB0, PB1). 0xFFFF = N/A (SPI/CS pins).
+static bool readAdc(uint16_t out10[10]) {
+  uint8_t prep = 0x44;
+  uint8_t raw[20];
+  if (!writeCmd(&prep, 1, false)) return false;
+  if (!readBytes(raw, sizeof(raw))) return false;
+  for (int i = 0; i < 10; i++) {
+    out[i] = (uint16_t)raw[i * 2] | ((uint16_t)raw[i * 2 + 1] << 8);
+  }
+  return true;
+}
+
+// 0x45: bits 8..11 = PA1..PA4 as dedicated analog inputs (U8..U11). Other bits ignored.
+static bool setGpioAdcMask(uint16_t mask) {
+  uint8_t cmd[3] = {0x45, (uint8_t)(mask & 0xFF), (uint8_t)((mask >> 8) & 0xFF)};
+  return writeCmd(cmd, sizeof(cmd));
+}
+
 static void setRtc_2026_03_31_12_00_00() {
   // 0x31 YY MM DD HH MM SS, year = 2000 + YY
   uint8_t cmd[7] = {0x31, 26, 3, 31, 12, 0, 0};
@@ -73,6 +91,19 @@ void setup() {
 
   uint16_t levels = readGpioLevels();
   Serial.printf("GPIO levels mask: 0x%04X\n", levels);
+
+  uint16_t adc[10];
+  if (readAdc(adc)) {
+    Serial.println("ADC IN0..IN9 (0xFFFF = unavailable on this board):");
+    for (int i = 0; i < 10; i++) {
+      Serial.printf("  IN%u: %u\n", (unsigned)i, (unsigned)adc[i]);
+    }
+  } else {
+    Serial.println("ADC read failed");
+  }
+
+  // Optional: keep PA1..PA4 in analog mode for repeated 0x44 reads (mask bits 8..11).
+  // setGpioAdcMask(0x0F00);
 
   setRtc_2026_03_31_12_00_00();
 }

@@ -1,4 +1,5 @@
 #include "stm32f4xx_hal.h"
+#include "stm32f4xx_hal_adc.h"
 #include <stdbool.h>
 #include <string.h>
 
@@ -16,11 +17,20 @@
 //   0x41 [outL outH]       - set 16-pin outputs (only applied to pins configured as output)
 //   0x42 [idx] [0|1]       - set one pin output level (also forces that pin to output)
 //   0x43                  - prepare next read: 2 bytes pin levels (inL inH) for 16 pins
+//   0x44                  - prepare next read: 20 bytes — 10x uint16 LE, ADC IN0..IN9
+//                           (PA0..PA7, PB0, PB1). Channels unavailable on this board
+//                           (SPI1: PA5..PA7; MCP41010 CS: PB0, PB1) return 0xFFFF.
+//   0x45 [maskL maskH]    - set ADC mode for U8..U11 (PA1..PA4): bit=1 → pin is analog ADC;
+//                           only bits 8..11 of 16-bit mask are used. Mutually exclusive with
+//                           digital GPIO on those pins: cleared by 0x40 (full dir update) or
+//                           0x42 on that index (forces output). Output/input for U8..U11: use
+//                           0x40/0x41/0x42 with ADC bits cleared.
 // Read (master <- slave), after a write command:
 //   default: 1 byte current output mask
 //   after 0x21: 4 bytes pot values (P0..P3)
 //   after 0x30: 6 bytes RTC time
 //   after 0x43: 2 bytes pin levels (16 pins)
+//   after 0x44: 20 bytes — ADC raw 12-bit (0..4095), little-endian per channel
 //
 // Hardware mapping (Blackpill F411CE):
 // I2C1: PB6=SCL, PB7=SDA
@@ -41,12 +51,18 @@
 #define CMD_GPIO_WRITE        0x41U
 #define CMD_GPIO_WRITE1       0x42U
 #define CMD_GPIO_READ         0x43U
+#define CMD_ADC_READ          0x44U
+#define CMD_GPIO_ADC          0x45U
+#define GPIO_ADC_MASK_U8_U11  0x0F00U
 #define POT_STARTUP_VALUE     200U
 #define I2C_RX_BUF_SIZE       8U
+#define ADC_NUM_CHANNELS      10U
+#define ADC_NA                0xFFFFU
 
 I2C_HandleTypeDef hi2c1;
 SPI_HandleTypeDef hspi1;
 DMA_HandleTypeDef hdma_spi1_tx;
+ADC_HandleTypeDef hadc1;
 RTC_HandleTypeDef hrtc;
 IWDG_HandleTypeDef hiwdg;
 
@@ -57,7 +73,7 @@ static volatile bool g_i2cRxActive = false;
 static volatile uint32_t g_lastI2cMs = 0;
 
 static uint8_t g_i2cRxBuf[I2C_RX_BUF_SIZE];
-static uint8_t g_i2cTxBuf[8];
+static uint8_t g_i2cTxBuf[32];
 static uint8_t g_i2cTxLen = 0;
 static uint8_t g_i2cTxIdx = 0;
 static uint8_t g_i2cCmd = 0;
@@ -66,12 +82,15 @@ static uint8_t g_i2cReceived = 0;
 static volatile bool g_sendPotsOnNextRead = false;
 static volatile uint8_t g_sendRtcOnNextRead = 0;
 static volatile uint8_t g_sendGpioOnNextRead = 0;
+static volatile uint8_t g_sendAdcOnNextRead = 0;
 
 static volatile bool g_potPending[4] = {false, false, false, false};
 static volatile uint8_t g_potValue[4] = {
     POT_STARTUP_VALUE, POT_STARTUP_VALUE, POT_STARTUP_VALUE, POT_STARTUP_VALUE};
 static volatile uint8_t g_activePot = 0xFF;
 static uint8_t g_spiTxBuf[2] = {0x11, POT_STARTUP_VALUE};  // 0x11=write pot0
+
+static uint8_t g_adcPrepared[ADC_NUM_CHANNELS * 2];
 
 // 16 universal pins: can be input or output.
 // Avoid SWD (PA13/PA14), I2C (PB6/PB7), SPI1 (PA5/PA6/PA7), and CS pins (PB0/PB1/PB2/PB10).
@@ -103,6 +122,8 @@ static GPIO_TypeDef *const U_PORTS[16] = {
 
 static volatile uint16_t g_gpioDir = 0x00U;   // 1=output
 static volatile uint16_t g_gpioOut = 0x0000U; // output shadow
+/* Bits 8..11 (U8..U11 = PA1..PA4): 1 = pin configured as analog ADC (not digital GPIO). */
+static volatile uint16_t g_gpioAdcMask = 0x0000U;
 
 static const uint16_t POT_CS_PINS[4] = {
     GPIO_PIN_0,   // PB0
@@ -117,8 +138,77 @@ static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_SPI1_Init(void);
 static void MX_RTC_Init(void);
+static void MX_ADC1_Init(void);
 static void MX_IWDG_Init(void);
 static void Error_Handler(void);
+static void ApplyGpioConfig(void);
+
+static void SetPinAnalog(GPIO_TypeDef *port, uint32_t pin) {
+  GPIO_InitTypeDef io = {0};
+  io.Pin = pin;
+  io.Mode = GPIO_MODE_ANALOG;
+  io.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(port, &io);
+}
+
+static uint16_t AdcReadChannel(uint32_t channel) {
+  ADC_ChannelConfTypeDef sConfig = {0};
+  sConfig.Channel = channel;
+  sConfig.Rank = 1;
+  sConfig.SamplingTime = ADC_SAMPLETIME_144CYCLES;
+  if (HAL_ADC_ConfigChannel(&hadc1, &sConfig) != HAL_OK) {
+    return ADC_NA;
+  }
+  if (HAL_ADC_Start(&hadc1) != HAL_OK) {
+    return ADC_NA;
+  }
+  if (HAL_ADC_PollForConversion(&hadc1, 80) != HAL_OK) {
+    (void)HAL_ADC_Stop(&hadc1);
+    return ADC_NA;
+  }
+  uint32_t raw = HAL_ADC_GetValue(&hadc1);
+  (void)HAL_ADC_Stop(&hadc1);
+  return (uint16_t)(raw & 0x0FFFU);
+}
+
+/* Fills 10 values for ADC1_IN0..IN9 (MCU pins PA0..PA7, PB0, PB1).
+ * IN5..IN7 (PA5..PA7): SPI1 — not usable as ADC while SPI pots are used.
+ * IN8..IN9 (PB0, PB1): MCP41010 chip-select outputs — not usable as analog inputs here.
+ * IN0..IN4: PA0 always sampled; PA1..PA4 use persistent analog if g_gpioAdcMask, else
+ *   brief switch to analog then ApplyGpioConfig restores digital GPIO. */
+static void AdcSampleAndPackPrepared(void) {
+  uint16_t v[ADC_NUM_CHANNELS];
+  for (uint32_t i = 0; i < ADC_NUM_CHANNELS; i++) {
+    v[i] = ADC_NA;
+  }
+
+  /* IN0 PA0 — not used as universal GPIO in this firmware */
+  SetPinAnalog(GPIOA, GPIO_PIN_0);
+  v[0] = AdcReadChannel(ADC_CHANNEL_0);
+
+  /* IN1..IN4 PA1..PA4 — shared with U8..U11 */
+  const uint32_t pa_pins[4] = {GPIO_PIN_1, GPIO_PIN_2, GPIO_PIN_3, GPIO_PIN_4};
+  const uint32_t adc_ch[4] = {
+      ADC_CHANNEL_1, ADC_CHANNEL_2, ADC_CHANNEL_3, ADC_CHANNEL_4};
+  for (int k = 0; k < 4; k++) {
+    const uint8_t uidx = (uint8_t)(8 + k);
+    if (((g_gpioAdcMask >> uidx) & 0x1U) != 0U) {
+      v[(uint32_t)k + 1U] = AdcReadChannel(adc_ch[k]);
+    } else {
+      SetPinAnalog(GPIOA, pa_pins[k]);
+      v[(uint32_t)k + 1U] = AdcReadChannel(adc_ch[k]);
+    }
+  }
+  ApplyGpioConfig();
+
+  /* IN5..IN7 (PA5..PA7): SPI */
+  /* IN8..IN9 (PB0, PB1): pot CS — leave as ADC_NA */
+
+  for (uint32_t i = 0; i < ADC_NUM_CHANNELS; i++) {
+    g_adcPrepared[i * 2U] = (uint8_t)(v[i] & 0xFFU);
+    g_adcPrepared[i * 2U + 1U] = (uint8_t)((v[i] >> 8) & 0xFFU);
+  }
+}
 
 static void SetStatusLed(uint8_t on) {
   g_ledState = on ? 1 : 0;
@@ -128,6 +218,10 @@ static void SetStatusLed(uint8_t on) {
 
 static void ApplyGpioConfig(void) {
   for (uint8_t i = 0; i < 16; i++) {
+    if (i >= 8U && i <= 11U && ((g_gpioAdcMask >> i) & 0x1U) != 0U) {
+      SetPinAnalog(U_PORTS[i], U_PINS[i]);
+      continue;
+    }
     GPIO_InitTypeDef io = {0};
     io.Pin = U_PINS[i];
     if ((g_gpioDir >> i) & 0x1U) {
@@ -147,6 +241,9 @@ static void ApplyGpioConfig(void) {
 static inline uint16_t ReadGpioLevels(void) {
   uint16_t m = 0;
   for (uint8_t i = 0; i < 16; i++) {
+    if (i >= 8U && i <= 11U && ((g_gpioAdcMask >> i) & 0x1U) != 0U) {
+      continue; /* ADC pins: digital level not defined; bit reads as 0 */
+    }
     GPIO_PinState st = HAL_GPIO_ReadPin(U_PORTS[i], U_PINS[i]);
     if (st == GPIO_PIN_SET) m |= (uint16_t)(1U << i);
   }
@@ -210,6 +307,8 @@ static uint8_t CommandExpectedLen(uint8_t cmd) {
     case CMD_GPIO_WRITE: return 3;
     case CMD_GPIO_WRITE1: return 3;
     case CMD_GPIO_READ: return 1;
+    case CMD_ADC_READ: return 1;
+    case CMD_GPIO_ADC: return 3;
     default: return 1;
   }
 }
@@ -299,6 +398,8 @@ static void ProcessI2cCommand(const uint8_t *buf, uint8_t len) {
     return;
   }
   if (cmd == CMD_GPIO_DIR && len >= 3) {
+    /* Full direction update: exit ADC mode on PA1..PA4 (U8..U11); user may re-send 0x45. */
+    g_gpioAdcMask &= (uint16_t)~GPIO_ADC_MASK_U8_U11;
     g_gpioDir = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8);
     ApplyGpioConfig();
     return;
@@ -315,6 +416,9 @@ static void ProcessI2cCommand(const uint8_t *buf, uint8_t len) {
     uint8_t idx = buf[1];
     uint8_t v = buf[2] ? 1U : 0U;
     if (idx < 16) {
+      if (idx >= 8U && idx <= 11U) {
+        g_gpioAdcMask &= (uint16_t)~(1U << idx);
+      }
       g_gpioDir |= (uint16_t)(1U << idx);
       if (v) g_gpioOut |= (uint16_t)(1U << idx);
       else g_gpioOut &= (uint16_t)~(1U << idx);
@@ -325,6 +429,17 @@ static void ProcessI2cCommand(const uint8_t *buf, uint8_t len) {
   }
   if (cmd == CMD_GPIO_READ && len >= 1) {
     g_sendGpioOnNextRead = 1U;
+    return;
+  }
+  if (cmd == CMD_ADC_READ && len >= 1) {
+    AdcSampleAndPackPrepared();
+    g_sendAdcOnNextRead = 1U;
+    return;
+  }
+  if (cmd == CMD_GPIO_ADC && len >= 3) {
+    uint16_t m = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8);
+    g_gpioAdcMask = (uint16_t)(m & GPIO_ADC_MASK_U8_U11);
+    ApplyGpioConfig();
     return;
   }
 }
@@ -343,6 +458,7 @@ int main(void) {
   MX_DMA_Init();
   MX_SPI1_Init();
   MX_RTC_Init();
+  MX_ADC1_Init();
   MX_I2C1_Init();
   MX_IWDG_Init();
 
@@ -400,6 +516,10 @@ void HAL_I2C_AddrCallback(I2C_HandleTypeDef *hi2c, uint8_t TransferDirection,
       g_i2cTxLen = 2;
       g_i2cTxBuf[0] = (uint8_t)(lvl & 0xFFU);
       g_i2cTxBuf[1] = (uint8_t)((lvl >> 8) & 0xFFU);
+    } else if (g_sendAdcOnNextRead) {
+      g_sendAdcOnNextRead = 0;
+      g_i2cTxLen = (uint8_t)(ADC_NUM_CHANNELS * 2U);
+      memcpy(g_i2cTxBuf, g_adcPrepared, g_i2cTxLen);
     } else if (g_sendPotsOnNextRead) {
       g_sendPotsOnNextRead = false;
       g_i2cTxLen = 4;
@@ -679,6 +799,31 @@ static void MX_IWDG_Init(void) {
   if (HAL_IWDG_Init(&hiwdg) != HAL_OK) {
     Error_Handler();
   }
+}
+
+static void MX_ADC1_Init(void) {
+  hadc1.Instance = ADC1;
+  hadc1.Init.ClockPrescaler = ADC_CLOCK_SYNC_PCLK_DIV4;
+  hadc1.Init.Resolution = ADC_RESOLUTION_12B;
+  hadc1.Init.ScanConvMode = DISABLE;
+  hadc1.Init.ContinuousConvMode = DISABLE;
+  hadc1.Init.DiscontinuousConvMode = DISABLE;
+  hadc1.Init.ExternalTrigConvEdge = ADC_EXTERNALTRIGCONVEDGE_NONE;
+  hadc1.Init.ExternalTrigConv = ADC_SOFTWARE_START;
+  hadc1.Init.DataAlign = ADC_DATAALIGN_RIGHT;
+  hadc1.Init.NbrOfConversion = 1;
+  hadc1.Init.DMAContinuousRequests = DISABLE;
+  hadc1.Init.EOCSelection = ADC_EOC_SINGLE_CONV;
+  if (HAL_ADC_Init(&hadc1) != HAL_OK) {
+    Error_Handler();
+  }
+}
+
+void HAL_ADC_MspInit(ADC_HandleTypeDef *hadc) {
+  if (hadc->Instance != ADC1) {
+    return;
+  }
+  __HAL_RCC_ADC1_CLK_ENABLE();
 }
 
 static void MX_GPIO_Init(void) {

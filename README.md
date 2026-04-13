@@ -4,6 +4,7 @@
 
 Firmware for `STM32F411CE BlackPill` operating as an **I2C slave** for ESP32/CYD:
 - 16 universal GPIOs (input/output)
+- ADC readout on MCU pins **PA0…PA4** (and protocol slots for PA5…PA7, PB0, PB1 with hardware conflicts documented)
 - control of 4x MCP41010 digital potentiometers (SPI)
 - RTC read/set over I2C
 - watchdog reset when I2C activity is lost
@@ -31,13 +32,16 @@ Firmware for `STM32F411CE BlackPill` operating as an **I2C slave** for ESP32/CYD
 | `0x41` | Set GPIO output 16-bit | `outL`, `outH` |
 | `0x42` | Set one GPIO bit | `idx(0..15)`, `val` |
 | `0x43` | Prepare read GPIO levels | — |
+| `0x44` | Prepare read ADC (10× uint16) | — |
+| `0x45` | Set ADC-only mode for U8..U11 (PA1..PA4) | `maskL`, `maskH` (use bits 8..11; 1 = analog ADC pin) |
 
 ### Read Responses (after write)
 
 - default: `1` byte (`g_outputMask`, U0..U7)
 - after `0x21`: `4` bytes (`P0..P3`)
 - after `0x30`: `6` bytes (`YY MM DD HH MM SS`)
-- after `0x43`: `2` bytes (`levelsL levelsH`)
+- after `0x43`: `2` bytes (`levelsL levelsH`; U8..U11 bits are **0** if those pins are in ADC-only mode via `0x45`)
+- after `0x44`: `20` bytes — ADC **IN0..IN9** (PA0..PA7, PB0, PB1 order); **0xFFFF** = channel not available (SPI: PA5..PA7; CS outputs: PB0, PB1)
 
 ### Pin Usage in Firmware
 
@@ -48,6 +52,8 @@ Firmware for `STM32F411CE BlackPill` operating as an **I2C slave** for ESP32/CYD
 - `PA13/PA14` — SWD
 - `PC14/PC15` — LSE (optional, for RTC)
 - U0..U15: `PA8,PA9,PA10,PA11,PA12,PB12,PB13,PB14,PA1,PA2,PA3,PA4,PB3,PB4,PB5,PB8`
+- ADC: **PA0** and **PA1..PA4** (shared with U8..U11); **PA5..PA7** and **PB0, PB1** are not usable as analog inputs in this build (SPI / pot CS)
+- **U8..U11 tri-mode:** digital in/out via `0x40`/`0x41`/`0x42`; **`0x45`** bits 8..11 select **analog-only** for PA1..PA4. **`0x40` clears** all four ADC-mode bits; **`0x42`** on index 8..11 clears ADC for that pin.
 
 ### Build and Flash
 
@@ -82,6 +88,7 @@ Detailed protocol/pinout docs and examples:
 
 Прошивка для `STM32F411CE BlackPill`, яка працює як **I2C slave** для ESP32/CYD:
 - 16 універсальних GPIO (input/output)
+- зчитування ADC на **PA0…PA4** (у протоколі також слоти для PA5…PA7, PB0, PB1 — див. конфлікти з SPI/CS у документації)
 - керування 4x MCP41010 (SPI)
 - RTC read/set через I2C
 - watchdog reset при втраті I2C-активності
@@ -109,13 +116,16 @@ Detailed protocol/pinout docs and examples:
 | `0x41` | Set GPIO output 16-bit | `outL`, `outH` |
 | `0x42` | Set one GPIO bit | `idx(0..15)`, `val` |
 | `0x43` | Prepare read GPIO levels | — |
+| `0x44` | Prepare read ADC (10× uint16) | — |
+| `0x45` | Режим лише ADC для U8…U11 (PA1…PA4) | `maskL`, `maskH` (біти 8…11) |
 
 ### Read-відповіді (після write)
 
 - default: `1` байт (`g_outputMask`, U0..U7)
 - після `0x21`: `4` байти (`P0..P3`)
 - після `0x30`: `6` байтів (`YY MM DD HH MM SS`)
-- після `0x43`: `2` байти (`levelsL levelsH`)
+- після `0x43`: `2` байти (`levelsL levelsH`; біти U8…U11 = **0**, якщо ці піни в режимі ADC через `0x45`)
+- після `0x44`: `20` байтів — ADC IN0..IN9; **0xFFFF** = канал недоступний (SPI: PA5..PA7; CS: PB0, PB1)
 
 ### Піни в прошивці
 
@@ -126,6 +136,8 @@ Detailed protocol/pinout docs and examples:
 - `PA13/PA14` — SWD
 - `PC14/PC15` — LSE (опційно для RTC)
 - U0..U15: `PA8,PA9,PA10,PA11,PA12,PB12,PB13,PB14,PA1,PA2,PA3,PA4,PB3,PB4,PB5,PB8`
+- ADC: **PA0**, **PA1..PA4** (разом з U8..U11); **PA5..PA7**, **PB0, PB1** у цій збірці не для аналогового входу (SPI / CS потів)
+- **U8…U11:** цифра — `0x40`/`0x41`/`0x42`; **лише ADC** — `0x45` (біти 8…11). **`0x40` скидає** всі чотири ADC-біти; **`0x42`** на idx 8…11 знімає ADC з одного піна.
 
 ### Збірка і прошивка
 

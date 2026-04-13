@@ -31,14 +31,14 @@ ESP32 `Wire` note: multi-byte commands are received byte-by-byte (`I2C_FIRST_FRA
 
 | Pin (MCU) | Firmware role | Details |
 |---|---|---|
-| **PA0** | not used | free |
-| **PA1** | universal GPIO **U8** | `0x40/0x41/0x42/0x43` |
-| **PA2** | universal GPIO **U9** | `0x40/0x41/0x42/0x43` |
-| **PA3** | universal GPIO **U10** | `0x40/0x41/0x42/0x43` |
-| **PA4** | universal GPIO **U11** | check board-specific conflicts on some variants |
-| **PA5** | **SPI1 SCK** | MCP41010 |
-| **PA6** | **SPI1 MISO (AF)** | MCP41010 has no MISO; kept in AF due to 2LINES mode |
-| **PA7** | **SPI1 MOSI** | MCP41010 |
+| **PA0** | **ADC1_IN0** | analog input via `0x44` (not part of U0..U15) |
+| **PA1** | universal GPIO **U8** + **ADC1_IN1** | Digital: `0x40`/`0x41`/`0x42`. **ADC mode:** `0x45` bit 8=1 keeps pin analog (see below). |
+| **PA2** | universal GPIO **U9** + **ADC1_IN2** | Same; `0x45` bit 9 |
+| **PA3** | universal GPIO **U10** + **ADC1_IN3** | Same; `0x45` bit 10 |
+| **PA4** | universal GPIO **U11** + **ADC1_IN4** | Same; `0x45` bit 11 |
+| **PA5** | **SPI1 SCK** | MCP41010; **not usable as ADC** while SPI pots are used |
+| **PA6** | **SPI1 MISO (AF)** | MCP41010 has no MISO; kept in AF due to 2LINES mode; **ADC N/A** |
+| **PA7** | **SPI1 MOSI** | MCP41010; **ADC N/A** |
 | **PA8** | universal GPIO **U0** | affected by legacy `0x01/0x02` |
 | **PA9** | universal GPIO **U1** | affected by legacy `0x01/0x02` |
 | **PA10** | universal GPIO **U2** | affected by legacy `0x01/0x02` |
@@ -47,8 +47,8 @@ ESP32 `Wire` note: multi-byte commands are received byte-by-byte (`I2C_FIRST_FRA
 | **PA13** | **SWDIO** | debug |
 | **PA14** | **SWCLK** | debug |
 | **PA15** | not used | usually kept free |
-| **PB0** | **CS pot0** | MCP41010 chip select |
-| **PB1** | **CS pot1** | MCP41010 chip select |
+| **PB0** | **CS pot0** | MCP41010 chip select; **ADC N/A** (digital CS) |
+| **PB1** | **CS pot1** | MCP41010 chip select; **ADC N/A** |
 | **PB2** | **CS pot2** | MCP41010 chip select |
 | **PB3** | universal GPIO **U12** | may conflict with JTAG in some setups |
 | **PB4** | universal GPIO **U13** | may conflict with JTAG in some setups |
@@ -111,6 +111,14 @@ Direction mask: `1=output`, `0=input`. Input mode uses internal pull-up; output 
 | **0x41** | GPIO write | `outL`, `outH` (little-endian 16-bit) | 3 |
 | **0x42** | GPIO write one | `idx` (0..15), `val` (0/1) | 3 |
 | **0x43** | Prepare read GPIO | — | 1 |
+| **0x44** | Prepare read ADC | — | 1 |
+| **0x45** | Set ADC mode for **U8..U11** (PA1..PA4) | `maskL`, `maskH` (little-endian 16-bit; **only bits 8..11** used: 1 = pin is **analog ADC**, not digital GPIO) | 3 |
+
+**U8..U11 (PA1..PA4) — three ways to use the pin**
+
+1. **Digital output / input:** use `0x40` (direction), `0x41`, `0x42` as before. Sending **`0x40` clears ADC mode on all four** (bits 8..11 of the internal ADC mask). **`0x42`** to index 8..11 forces **output** and clears ADC for that pin only.
+2. **Dedicated ADC (pin stays analog):** `0x45` with the corresponding bit (8..11) set to **1**. Then `0x44` reads IN1..IN4 without briefly reconfiguring the pin. Digital GPIO commands do not drive the pin while its ADC bit is set (shadow registers may still change).
+3. **One-shot ADC without `0x45`:** `0x44` alone still works: pins are switched to analog for sampling, then restored to the last `0x40`/GPIO config.
 
 ### I2C Read Responses (slave -> master)
 
@@ -119,7 +127,8 @@ Direction mask: `1=output`, `0=input`. Input mode uses internal pull-up; output 
 | default | **1** | `g_outputMask` (U0..U7) |
 | **0x21** | **4** | P0, P1, P2, P3 |
 | **0x30** | **6** | YY, MM, DD, HH, MM, SS |
-| **0x43** | **2** | `levelsL`, `levelsH` (physical logic levels) |
+| **0x43** | **2** | `levelsL`, `levelsH` (physical logic levels). For **U8..U11** in ADC-only mode (`0x45`), those bits read as **0**. |
+| **0x44** | **20** | Ten **uint16** values, **little-endian**, 12-bit ADC (0..4095): **IN0..IN9** = MCU pins **PA0, PA1, PA2, PA3, PA4, PA5, PA6, PA7, PB0, PB1**. Unavailable channels return **0xFFFF** (SPI uses PA5..PA7; PB0/PB1 are pot **CS** outputs). |
 
 Only the latest "prepare read" command is retained before the next read.
 
@@ -133,6 +142,22 @@ Wire.requestFrom(0x30, 2);
 uint8_t lo = Wire.read();
 uint8_t hi = Wire.read();
 uint16_t levels = (uint16_t)lo | ((uint16_t)hi << 8);
+```
+
+ADC (`0x44`): read 10× uint16 (20 bytes), channel index `i` → `INi`:
+
+```cpp
+Wire.beginTransmission(0x30);
+Wire.write(0x44);
+Wire.endTransmission(false);
+Wire.requestFrom(0x30, 20);
+uint16_t adc[10];
+for (int i = 0; i < 10; i++) {
+  uint8_t lo = Wire.read();
+  uint8_t hi = Wire.read();
+  adc[i] = (uint16_t)lo | ((uint16_t)hi << 8);
+}
+// adc[0]..adc[4] = PA0..PA4; adc[5]..adc[7] = 0xFFFF (SPI); adc[8],adc[9] = 0xFFFF (CS)
 ```
 
 ### Other Firmware Mechanics
@@ -179,14 +204,14 @@ uint16_t levels = (uint16_t)lo | ((uint16_t)hi << 8);
 
 | Пін (MCU) | Роль у прошивці | Деталі / примітки |
 |---|---|---|
-| **PA0** | не використовується | (вільний) |
-| **PA1** | універсальний GPIO **U8** | `0x40/0x41/0x42/0x43`, input pull-up або output PP |
-| **PA2** | універсальний GPIO **U9** | `0x40/0x41/0x42/0x43` |
-| **PA3** | універсальний GPIO **U10** | `0x40/0x41/0x42/0x43` |
-| **PA4** | універсальний GPIO **U11** | `0x40/0x41/0x42/0x43`; на деяких платах може конфліктувати (перевір залізо) |
-| **PA5** | **SPI1 SCK** | MCP41010 |
-| **PA6** | **SPI1 MISO (AF)** | MCP41010 MISO не має; пін все одно налаштований як AF (2LINES), `pull-up` |
-| **PA7** | **SPI1 MOSI** | MCP41010 |
+| **PA0** | **ADC1_IN0** | аналоговий вхід через `0x44` (не входить до U0…U15) |
+| **PA1** | універсальний GPIO **U8** + **ADC1_IN1** | Цифра: `0x40`/`0x41`/`0x42`. **Режим лише ADC:** `0x45` біт 8=1 (див. нижче). |
+| **PA2** | універсальний GPIO **U9** + **ADC1_IN2** | Те саме; `0x45` біт 9 |
+| **PA3** | універсальний GPIO **U10** + **ADC1_IN3** | Те саме; `0x45` біт 10 |
+| **PA4** | універсальний GPIO **U11** + **ADC1_IN4** | Те саме; `0x45` біт 11; на деяких платах можливі залізні конфлікти |
+| **PA5** | **SPI1 SCK** | MCP41010; **не ADC** у цій прошивці (зайнятий SPI) |
+| **PA6** | **SPI1 MISO (AF)** | MCP41010 MISO не має; AF (2LINES); **ADC N/A** |
+| **PA7** | **SPI1 MOSI** | MCP41010; **ADC N/A** |
 | **PA8** | універсальний GPIO **U0** | legacy `0x01/0x02` зачіпають U0…U7 |
 | **PA9** | універсальний GPIO **U1** | legacy U0…U7 |
 | **PA10** | універсальний GPIO **U2** | legacy U0…U7 |
@@ -195,8 +220,8 @@ uint16_t levels = (uint16_t)lo | ((uint16_t)hi << 8);
 | **PA13** | **SWDIO** | налагодження (не чіпати) |
 | **PA14** | **SWCLK** | налагодження (не чіпати) |
 | **PA15** | не використовується | (вільний; у багатьох проектах уникають через JTAG/alternate-функції) |
-| **PB0** | **CS pot0** | MCP41010 chip select |
-| **PB1** | **CS pot1** | MCP41010 chip select |
+| **PB0** | **CS pot0** | MCP41010 CS; **ADC N/A** (цифровий вихід) |
+| **PB1** | **CS pot1** | MCP41010 CS; **ADC N/A** |
 | **PB2** | **CS pot2** | MCP41010 chip select |
 | **PB3** | універсальний GPIO **U12** | може бути пов’язаний з JTAG у деяких конфігураціях |
 | **PB4** | універсальний GPIO **U13** | може бути пов’язаний з JTAG у деяких конфігураціях |
@@ -300,6 +325,14 @@ uint16_t levels = (uint16_t)lo | ((uint16_t)hi << 8);
 | **0x41** | GPIO write | `outL`, `outH` (little-endian 16-bit) | 3 |
 | **0x42** | GPIO write one | `idx` (0…15), `val` (0/1) | 3 |
 | **0x43** | Prepare read GPIO | — | 1 |
+| **0x44** | Prepare read ADC | — | 1 |
+| **0x45** | Режим ADC для **U8…U11** (PA1…PA4) | `maskL`, `maskH` (little-endian; **лише біти 8…11**: 1 = пін як **аналоговий ADC**, не цифровий GPIO) | 3 |
+
+### U8…U11 (PA1…PA4): вихід, вхід або ADC
+
+1. **Цифровий вхід/вихід:** `0x40`, `0x41`, `0x42` як раніше. Команда **`0x40` скидає ADC-режим на всіх чотирьох** пінах. **`0x42`** з індексом 8…11 примусово **вихід** і знімає ADC лише з цього піна.
+2. **Тільки ADC (пін тримається в Analog):** `0x45` з бітами 8…11 = 1; далі `0x44` знімає показники без короткого «глитчу» перемикання в цифру.
+3. **Разове ADC без `0x45`:** лише `0x44` — пін на час виміру переводиться в Analog і повертається до останньої конфігурації GPIO.
 
 Невідома команда обробляється як довжина 1 (тільки `cmd`).
 
@@ -311,9 +344,13 @@ uint16_t levels = (uint16_t)lo | ((uint16_t)hi << 8);
 
 ### Поведінка **0x40 / 0x41 / 0x42**
 
-- **0x40:** задає повну 16-бітну маску напрямку `g_gpioDir`.
-- **0x41:** записує `g_gpioOut`; на пінах, які не output, рівень у тіньовому регістрі зберігається, але на ніжку не виходить; `g_outputMask = outL` (legacy-дзеркало).
-- **0x42:** один пін output + рівень; біт у `g_gpioDir` встановлюється.
+- **0x40:** задає повну 16-бітну маску напрямку `g_gpioDir`; **скидає внутрішню маску ADC для U8…U11** (потрібно знову надіслати `0x45`, якщо знову потрібен режим лише ADC).
+- **0x41:** записує `g_gpioOut`; на пінах, які не output, рівень у тіньовому регістрі зберігається, але на ніжку не виходить; `g_outputMask = outL` (legacy-дзеркало). Якщо U8…U11 у режимі `0x45`, фізичний рівень на ніжці не відповідає `g_gpioOut`.
+- **0x42:** один пін output + рівень; біт у `g_gpioDir` встановлюється; для **idx 8…11** знімає ADC-режим з цього піна.
+
+### Поведінка **0x45**
+
+- Зберігає лише біти **8…11** маски: `1` = відповідний пін (PA1…PA4) у режимі **Analog** для ADC; **0** = керування цим піном знову з `g_gpioDir` / `g_gpioOut` після `ApplyGpioConfig`.
 
 ### Поведінка **0x20** (поти)
 
@@ -334,7 +371,8 @@ uint16_t levels = (uint16_t)lo | ((uint16_t)hi << 8);
 | (за замовчуванням) | **1** | `g_outputMask` (біти U0…U7) |
 | **0x21** | **4** | P0, P1, P2, P3 (останні записані значення в прошивці) |
 | **0x30** | **6** | YY, MM, DD, HH, MM, SS (рік 2000+YY) |
-| **0x43** | **2** | `levelsL`, `levelsH` — поточні **фізичні** рівні 16 пінів (1 = HIGH) |
+| **0x43** | **2** | `levelsL`, `levelsH` — поточні **фізичні** рівні 16 пінів (1 = HIGH). Для **U8…U11** у режимі ADC (`0x45`) відповідні біти **0** (цифровий рівень не визначений). |
+| **0x44** | **20** | Десять значень **uint16** (little-endian), 12-bit ADC 0…4095: канали **IN0…IN9** = **PA0…PA7, PB0, PB1**. Недоступні канали (**PA5…PA7** — SPI; **PB0, PB1** — CS потів) = **0xFFFF**. |
 
 Якщо підряд відправити кілька “prepare …” команд, зберігається лише **остання** запрошена відповідь перед read.
 
@@ -352,6 +390,21 @@ Wire.requestFrom(0x30, 2);
 uint8_t lo = Wire.read();
 uint8_t hi = Wire.read();
 uint16_t levels = (uint16_t)lo | ((uint16_t)hi << 8);
+```
+
+Читати ADC (10 каналів × 2 байти):
+
+```cpp
+Wire.beginTransmission(0x30);
+Wire.write(0x44);
+Wire.endTransmission(false);
+Wire.requestFrom(0x30, 20);
+uint16_t adc[10];
+for (int i = 0; i < 10; i++) {
+  uint8_t lo = Wire.read();
+  uint8_t hi = Wire.read();
+  adc[i] = (uint16_t)lo | ((uint16_t)hi << 8);
+}
 ```
 
 Встановити U0 як output HIGH:
